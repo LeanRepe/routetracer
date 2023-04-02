@@ -1,1 +1,4 @@
 /venv/
+/examples/
+/trace_exec.log
+/topo.json
