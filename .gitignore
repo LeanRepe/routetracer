@@ -1,4 +1,4 @@
 /venv/
 /examples/
 /trace_exec.log
-/topo.json
+/database/topology_database.json

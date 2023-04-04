@@ -4,14 +4,15 @@ import ipaddress
 import datetime
 import logging
 import time
+import os
 from sys import exit
 from mtcollector import MTCollector
 from ipaddress import AddressValueError
 
 main_logger = logging.getLogger(__name__)
-main_logger.setLevel(logging.DEBUG)
+main_logger.setLevel(logging.INFO)
 logger_handler = logging.FileHandler(f'{__name__}.log', mode='w')
-logger_formatter = logging.Formatter('%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
+logger_formatter = logging.Formatter('%(asctime)s,%(msecs)03d %(levelname)-3s [%(filename)s:%(lineno)d]8s %(message)s')
 logger_handler.setFormatter(logger_formatter)
 main_logger.addHandler(logger_handler)
 
@@ -33,31 +34,150 @@ class Regex:
     isis_source = r'^\s+src\s+(\S+)\.\S+,.*$'
 
 
-def new_edge(system_dict: dict, output_line: list) -> None:
-    edge = output_line[2]
-    interface = output_line[3]
-    metric = output_line[1]
-    if edge not in system_dict:
-        system_dict[edge] = {'nhi': interface, 'metric': metric}
+class IsisTopologyDB:
+    def __init__(self):
+        self.pe_dict = None
+        self.topology_dict = {}
+        self.db_wd = f'{os.getcwd()}/database'
+        self.file = None
+        self._load_from_file()
 
+    def set_pe_dict(self, pe_dict: dict) -> None:
+        self.pe_dict = pe_dict
 
-def nhop_system(system_dict: dict, output_line: list) -> None:
-    nh_systemp = output_line[0]
-    metric = output_line[1]
-    edge = output_line[2]
-    if nh_systemp not in system_dict:
-        system_dict[nh_systemp] = []
-    system_dict[nh_systemp].append((edge, metric))
+    def get_topology(self, force: bool = False) -> dict:
+        if not self.topology_dict:
+            if force is True or self.file is None:
+                self._first_time()
+        return self.topology_dict
 
+    def update_site(self, site: str) -> None:
+        if site in self.pe_dict:
+            self._gather_topology(target_device=site)
+            if self.file is None:
+                main_logger.error(f'Topology DB not loaded, after this run site will remain out of date')
+            else:
+                self._update_file(self.file)
+        else:
+            main_logger.error(f'Site {site} not found in PE Database, please update the source before retry')
+            exit(1)
 
-def get_system(output: str) -> str:
-    system_id = ''
-    for lines in output.splitlines():
-        line = lines.split()
-        if '--' in line:
-            system_id = line[0]
-            break
-    return system_id
+    def _update_file(self, file: str) -> None:
+        with open(file, 'w') as topology_file:
+            json.dump(self.topology_dict, topology_file, indent=4)
+            topology_file.close()
+
+    def _gather_topology(self, target_device: str = None) -> None:
+        global username
+        global password
+        global socks_proxy
+        show_topology = 'show isis instance CORE topology'
+        main_logger.info(f"Gathering ISIS topology - if it's a full discovery could take some time")
+        if not target_device:
+            output_isis = MTCollector(self.pe_dict, show_topology, user=username, paswd=password,
+                                      sock_proxy=socks_proxy, max_threads=3)
+            for device in output_isis:
+                if device != 'not_connected':
+                    self._topology_population(self.topology_dict, output_isis[device][0][show_topology])
+                else:
+                    if device in self.pe_dict:
+                        mgmt_ip = self.pe_dict[device]
+                        single_ouptut = single_device_collection(mgmt_ip, show_topology)
+                        main_logger.debug(f'"NOT_CONNECTED" OUTPUT COLLECTION\n{"-" * 30}')
+                        main_logger.debug(f'output {show_topology} for {device}:\n{"-" * 30}\n{single_ouptut}\n\n')
+                        if device in single_ouptut:
+                            self._topology_population(self.topology_dict, single_ouptut)
+                            self._update_file(self.file)
+                        else:
+                            main_logger.error(f'WARNING: Topology incomplete, unable to reach {device}')
+        else:
+            if target_device in self.pe_dict:
+                mgmt_ip = self.pe_dict[target_device]
+                single_ouptut = single_device_collection(mgmt_ip, show_topology)
+                main_logger.debug(f'TARGETED OUTPUT COLLECTION\n{"-" * 30}')
+                main_logger.debug(f'output {show_topology} for {target_device}:\n{"-" * 30}\n{single_ouptut}\n\n')
+                try:
+                    self._topology_population(self.topology_dict, single_ouptut)
+                    self._update_file(self.file)
+                except TypeError:
+                    main_logger.error(f'WARNING: Topology incomplete, unable to reach {target_device}')
+
+    def _topology_population(self, topology_dict: dict, output: str) -> None:
+        main_logger.info('Starting Topology Population')
+        system = self.get_system(output)
+        if system not in topology_dict:
+            main_logger.debug(f'System not detected in current topology, creating base data structure')
+            topology_dict[system] = {'edges': {}, 'nhsystems': {}}
+        for index, lines in enumerate(output.splitlines()):
+            no_newline_output = lines.split()
+            if len(no_newline_output) > 2 and index > 4:
+                if '--' not in no_newline_output:
+                    if no_newline_output[0] == no_newline_output[2]:
+                        main_logger.debug(f'\nEDGE DETECTED\n{"-"*30}\n\n Edge: {no_newline_output[0]}')
+                        self._new_edge(topology_dict[system]['edges'], no_newline_output)
+                    else:
+                        if index > 1:
+                            self._nhop_system(topology_dict[system]['nhsystems'], no_newline_output)
+
+    def _load_from_file(self):
+        topology_file_list = [os.path.join(self.db_wd, f) for f in os.listdir(self.db_wd) if 'topology' in f]
+        if len(topology_file_list) > 0:
+            if self._check_if_update(topology_file_list[0]):
+                main_logger.warning(f'File is older than 6hs, if you want to update the file set force to true')
+            with open(topology_file_list[0], 'r') as topology_file:
+                main_logger.debug(f'ISIS topology file detected: {topology_file_list[0]}')
+                self.file = topology_file_list[0]
+                self.topology_dict = json.load(topology_file)
+
+    def _first_time(self):
+        main_logger.info(f'ISIS topology file not detected or force set to True! '
+                         f'running a first time full topology query')
+        self._gather_topology()
+        main_logger.info(f'ISIS Topology captured, saving to file...')
+        if self.topology_dict:
+            with open(f'{self.db_wd}/topology_database.json', 'w') as topology_file:
+                self.file = topology_file
+                json.dump(self.topology_dict, topology_file, indent=4)
+                topology_file.close()
+
+    @staticmethod
+    def _check_if_update(file: str, hours: int = 6) -> bool:
+        file_timestamp = os.path.getmtime(file)
+        file_timestamp_delta = datetime.datetime.fromtimestamp(file_timestamp)
+        delta = datetime.datetime.now() - file_timestamp_delta
+        main_logger.debug(f'File timestamp {file_timestamp_delta}, Current time: {datetime.datetime.now()}, '
+                          f'Delta: {delta}')
+        if (delta / datetime.timedelta(hours=1)) > hours:
+            return True
+        else:
+            return False
+
+    @staticmethod
+    def _new_edge(system_dict: dict, output_line: list) -> None:
+        edge = output_line[2]
+        interface = output_line[3]
+        metric = output_line[1]
+        if edge not in system_dict:
+            system_dict[edge] = {'nhi': interface, 'metric': metric}
+
+    @staticmethod
+    def _nhop_system(system_dict: dict, output_line: list) -> None:
+        nh_systemp = output_line[0]
+        metric = output_line[1]
+        edge = output_line[2]
+        if nh_systemp not in system_dict:
+            system_dict[nh_systemp] = []
+        system_dict[nh_systemp].append((edge, metric))
+
+    @staticmethod
+    def _get_system(output: str) -> str:
+        system_id = ''
+        for lines in output.splitlines():
+            line = lines.split()
+            if '--' in line:
+                system_id = line[0]
+                break
+        return system_id
 
 
 def isis_topology_trace(topo_dict: dict, source: str, dest: str, hop: int = 0) -> list:
@@ -73,11 +193,13 @@ def isis_topology_trace(topo_dict: dict, source: str, dest: str, hop: int = 0) -
                 if dest in topo_dict[current_node]['nhsystems']:
                     edge = topo_dict[current_node]['nhsystems'][dest][0][0]
                     nhi = topo_dict[current_node]['edges'][edge]['nhi']
-                    main_logger.debug(f'Current node: {current_node}, Edge: {edge}')
+                    main_logger.debug(f'Current node: {current_node}, Edge: {edge}, Previous node: {previous_node}')
                     if hop > 0:
-                        if previous_node != '':
+                        if previous_node in topo_dict[current_node]['edges']:
                             ing_if = topo_dict[current_node]['edges'][previous_node]['nhi']
                         else:
+                            main_logger.error(f'Previous node: {previous_node} not in {current_node} edges DB, '
+                                              f'setting Ingress interface to blank')
                             ing_if = ''
                         hop_dict = {hop: {'node': current_node, 'egress_if': nhi, 'ingress_if': ing_if}}
                     else:
@@ -89,7 +211,12 @@ def isis_topology_trace(topo_dict: dict, source: str, dest: str, hop: int = 0) -
                     main_logger.debug(f'{hop_dict}')
                 elif dest in topo_dict[current_node]['edges']:
                     nhi = topo_dict[current_node]['edges'][dest]['nhi']
-                    ing_if = topo_dict[current_node]['edges'][previous_node]['nhi']
+                    if previous_node in topo_dict[current_node]['edges']:
+                        ing_if = topo_dict[current_node]['edges'][previous_node]['nhi']
+                    else:
+                        main_logger.error(f'Previous node: {previous_node} not in {current_node} edges DB, '
+                                          f'setting Ingress interface to blank')
+                        ing_if = ''
                     hop_dict = {hop: {'node': current_node, 'egress_if': nhi, 'ingress_if': ing_if}}
                     ing_ifz = topo_dict[dest]['edges'][current_node]['nhi']
                     end_dict = {hop+1: {'node': dest, 'egress_if': '-----', 'ingress_if': ing_ifz}}
@@ -107,21 +234,6 @@ def isis_topology_trace(topo_dict: dict, source: str, dest: str, hop: int = 0) -
     return hop_list
 
 
-def topology_population(topology_dict: dict, output: str) -> None:
-    system = get_system(output)
-    if system not in topology_dict:
-        topology_dict[system] = {'edges': {}, 'nhsystems': {}}
-    for index, lines in enumerate(output.splitlines()):
-        no_newline_output = lines.split()
-        if len(no_newline_output) > 2 and index > 4:
-            if '--' not in no_newline_output:
-                if no_newline_output[0] == no_newline_output[2]:
-                    new_edge(topology_dict[system]['edges'], no_newline_output)
-                else:
-                    if index > 1:
-                        nhop_system(topology_dict[system]['nhsystems'], no_newline_output)
-
-
 def cef_nhop(output: str) -> tuple:
     subnet = ''
     nhop_ip = ''
@@ -136,7 +248,7 @@ def cef_nhop(output: str) -> tuple:
             nhop_int = re.match(Regex.cef_int_nhop, line, re.M).group(1)
             nhop_addr = re.match(Regex.cef_int_nhop, line, re.M).group(2)
     main_logger.debug(f'CEF PARSER{"-"*30}\nSubnet: {subnet}, '
-              f'NHOP: {nhop_ip}, NHOP INT: {nhop_int}, NHOP ADDR: {nhop_addr}')
+                      f''f'NHOP: {nhop_ip}, NHOP INT: {nhop_int}, NHOP ADDR: {nhop_addr}')
     if '0.0.0.0' in subnet:
         if '/32' in subnet and 'null0' in nhop_addr:
             return 'null0', 'no-hop'
@@ -201,44 +313,9 @@ def single_device_collection(node_ip: str, show: str) -> str:
         return unpacked_output
 
 
-def gather_topology(pe_dict: dict, topo_dict: dict, target_device: str = None) -> dict:
-    global username
-    global password
-    global socks_proxy
-    show_topo = 'show isis instance CORE topology'
-    main_logger.info(f"Gathering ISIS topology - if it's a full discovery could take some time")
-    if target_device is None:
-        output_isis = MTCollector(pe_dict, show_topo, user=username, paswd=password,
-                                  sock_proxy=socks_proxy, max_threads=3)
-        for device in output_isis:
-            if device != 'not_connected':
-                topology_population(topo_dict, output_isis[device][0][show_topo])
-            else:
-                if device in pe_dict:
-                    lo10 = pe_dict[device]
-                    single_ouptut = single_device_collection(lo10, show_topo)
-                    main_logger.debug(f'"NOT_CONNECTED" OUTPUT COLLECTION\n{"-"*30}')
-                    main_logger.debug(f'output {show_topo} for {device}:\n{"-" * 30}\n{single_ouptut}\n\n')
-                    if device in single_ouptut:
-                        topology_population(topo_dict, single_ouptut)
-                    else:
-                        main_logger.error(f'WARNING: Topology incomplete, unable to reach {device}')
-    else:
-        if target_device in pe_dict:
-            lo10 = pe_dict[target_device]
-            single_ouptut = single_device_collection(lo10, show_topo)
-            main_logger.debug(f'TARGETED OUTPUT COLLECTION\n{"-" * 30}')
-            main_logger.debug(f'output {show_topo} for {target_device}:\n{"-" * 30}\n{single_ouptut}\n\n')
-            try:
-                topology_population(topo_dict, single_ouptut)
-            except TypeError:
-                main_logger.error(f'WARNING: Topology incomplete, unable to reach {target_device}')
-    return topo_dict
-
-
 def run(start_node: str, ip: str, topo_dict: dict, source_ip: str = None, vrf: str = None) -> tuple:
     if source_ip is None:
-        source_ip = get_conn_int(source, vrf, full_db)
+        source_ip = get_conn_int(start_node, vrf, full_db)
     if check_ip(start_node):
         start_node_ip = start_node
         start_node = [node for node, ip in full_db.items() if ip == start_node_ip][0]
@@ -303,24 +380,20 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                             next_node = isis_src(current_ip, cef_hop_net)
                             next_ip = full_db[next_node]
                             if len(hop_list) > 0:
-                                current_hop = [x for x,y in hop_list[-1].items()][0] + 1
-                                new_vrouter = {current_hop:
-                                    {
-                                        'node': current_node,
-                                        'ingress_if': 'TU-IP',
-                                        'egress_if': 'TU-IP'
-                                    }
-                                }
+                                current_hop = [x for x, y in hop_list[-1].items()][0] + 1
+                                new_vrouter = {current_hop: {'node': current_node,
+                                                             'ingress_if': 'TU-IP',
+                                                             'egress_if': 'TU-IP'
+                                                             }
+                                               }
                                 hop_list.append(new_vrouter)
                             else:
                                 current_hop = 0
-                                new_vrouter = {current_hop:
-                                                   {
-                                                       'node': current_node,
-                                                       'ingress_if': '---',
-                                                       'egress_if': 'TU-IP'
-                                                   }
-                                }
+                                new_vrouter = {current_hop: {'node': current_node,
+                                                             'ingress_if': '---',
+                                                             'egress_if': 'TU-IP'
+                                                             }
+                                               }
                                 hop_list.append(new_vrouter)
                         else:
                             next_node = isis_src(current_ip, cef_hop_net)
@@ -346,8 +419,10 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                     tunnel_descrip = single_device_collection(current_ip, show_desc)
                     next_node = tunnel_description(tunnel_descrip)
                     tunn_num = cef_int.split('ip')[1]
-                    main_logger.debug(f'---- NHOP Tunnel detected ---\nOutput\n{"-"*30}\n{tunnel_descrip}\n'
-                                  f'Parsed\n{"-"*30}\nNext Node: {next_node}, Tunnel Number: {tunn_num} ')
+                    main_logger.debug(
+                        f'---- NHOP Tunnel detected ---\nOutput\n{"-"*30}\n{tunnel_descrip}\n'
+                        f'Parsed\n{"-"*30}\nNext Node: {next_node}, Tunnel Number: {tunn_num} '
+                    )
                     if 'CS-PE' in next_node:
                         if len(hop_list) > 0:
                             current_hop = [x for x, y in hop_list[-1].items()][0]
@@ -356,23 +431,19 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                     else:
                         if len(hop_list) > 0:
                             current_hop = [x for x, y in hop_list[-1].items()][0] + 1
-                            new_vrouter = {current_hop:
-                                {
-                                    'node': current_node,
-                                    'ingress_if': '---',
-                                    'egress_if': f'{"TU-" + tunn_num}'
-                                }
-                            }
+                            new_vrouter = {current_hop: {'node': current_node,
+                                                         'ingress_if': '---',
+                                                         'egress_if': f'{"TU-" + tunn_num}'
+                                                         }
+                                           }
                             hop_list.append(new_vrouter)
                         else:
                             current_hop = 0
-                            new_vrouter = {current_hop:
-                                {
-                                    'node': current_node,
-                                    'ingress_if': 'Local',
-                                    'egress_if': f'{"TU-"+tunn_num}'
-                                }
-                            }
+                            new_vrouter = {current_hop: {'node': current_node,
+                                                         'ingress_if': 'Local',
+                                                         'egress_if': f'{"TU-"+tunn_num}'
+                                                         }
+                                           }
                             hop_list.append(new_vrouter)
                     try:
                         next_ip = full_db[next_node]
@@ -389,23 +460,19 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                                 ing_if = f'TU-{tunn_num}'
                             else:
                                 ing_if = 'TU-IP'
-                            new_vrouter = {current_hop:
-                                {
-                                    'node': current_node,
-                                    'ingress_if': f'{ing_if}',
-                                    'egress_if': f'{cef_hop_net}'
-                                }
-                            }
+                            new_vrouter = {current_hop: {'node': current_node,
+                                                         'ingress_if': f'{ing_if}',
+                                                         'egress_if': f'{cef_hop_net}'
+                                                         }
+                                           }
                             hop_list.append(new_vrouter)
                         else:
                             current_hop = 0
-                            new_vrouter = {current_hop:
-                                {
-                                    'node': current_node,
-                                    'ingress_if': f'{cef_hop_net}',
-                                    'egress_if': f'{"TU-"+tunn_num}'
-                                }
-                            }
+                            new_vrouter = {current_hop: {'node': current_node,
+                                                         'ingress_if': f'{cef_hop_net}',
+                                                         'egress_if': f'{"TU-"+tunn_num}'
+                                                         }
+                                           }
                             hop_list.append(new_vrouter)
                 else:
                     main_logger.error(f'Unable to trace cef next_hop {cef_hop_net}, cef interface {cef_int}')
@@ -457,19 +524,23 @@ username = 'cisco_transport_sdn'
 password = 'Ciscosdn!123'
 socks_proxy = ('127.0.0.1', 8023)
 if __name__ == '__main__':
+    cwd = os.getcwd()
     start_time = datetime.datetime.now()
     main_logger.info(f'Starting at {start_time}')
     with open('/Users/lrepetto/Documents/full_db.json', 'r') as file:
         full_db = json.load(file)
         file.close()
-    with open('topo.json', 'r') as file_two:
-        topo_dict = json.load(file_two)
-        file.close()
-    source = 'ATATLP0002A-CS000-PE001'
+    with open(f'{cwd}/database/dish_pes.json') as pe_file:
+        pe_dict = json.load(pe_file)
+        pe_file.close()
+    topology = IsisTopologyDB()
+    topology.set_pe_dict(pe_dict)
+    topology_dict = topology.get_topology(force=True)
+    source = 'che1r00001-ne-pe01'
     vrf = '5GC-OAM'
     ip = '10.231.194.253'
     main_logger.info(f'Start Trace to ip {ip} at vrf {vrf}')
-    result, rfp_result = run(source, ip, topo_dict, vrf=vrf)
+    result, rfp_result = run(source, ip, topology_dict, vrf=vrf)
     main_logger.warning('Trace finished')
     end_host, end_ip, hop_list = result
     rpf_host, rpf_ip, rpf_list = rfp_result
