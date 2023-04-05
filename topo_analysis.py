@@ -10,15 +10,11 @@ from mtcollector import MTCollector
 from ipaddress import AddressValueError
 
 main_logger = logging.getLogger(__name__)
-main_logger.setLevel(logging.INFO)
+main_logger.setLevel(logging.DEBUG)
 logger_handler = logging.FileHandler(f'{__name__}.log', mode='w')
 logger_formatter = logging.Formatter('%(asctime)s,%(msecs)03d %(levelname)-3s [%(filename)s:%(lineno)d]8s %(message)s')
 logger_handler.setFormatter(logger_formatter)
 main_logger.addHandler(logger_handler)
-
-with open('examples/example-phphl_pe1', 'r') as file:
-    output = file.readlines()
-    file.close()
 
 
 class Regex:
@@ -32,6 +28,7 @@ class Regex:
     tunnel_desc = r'^.*To\s+(\S+):Tunnel-ip\d+$'
     connected_route = r'^^L\s+(\S+)\sis directly connected, \S+\s+(\S+)$'
     isis_source = r'^\s+src\s+(\S+)\.\S+,.*$'
+    isis_instance = r'^IS-IS\s(\S+)\spaths.*$'
 
 
 class IsisTopologyDB:
@@ -45,10 +42,9 @@ class IsisTopologyDB:
     def set_pe_dict(self, pe_dict: dict) -> None:
         self.pe_dict = pe_dict
 
-    def get_topology(self, force: bool = False) -> dict:
+    def get_topology(self) -> dict:
         if not self.topology_dict:
-            if force is True or self.file is None:
-                self._first_time()
+            self._first_time()
         return self.topology_dict
 
     def update_site(self, site: str) -> None:
@@ -62,7 +58,16 @@ class IsisTopologyDB:
             main_logger.error(f'Site {site} not found in PE Database, please update the source before retry')
             exit(1)
 
+    def update_topology(self, force: bool = False):
+        if force is True:
+            self._first_time()
+        else:
+            self._gather_topology()
+
     def _update_file(self, file: str) -> None:
+        with open(file, 'w') as topology_file:
+            topology_file.truncate(0)
+            topology_file.close()
         with open(file, 'w') as topology_file:
             json.dump(self.topology_dict, topology_file, indent=4)
             topology_file.close()
@@ -71,53 +76,73 @@ class IsisTopologyDB:
         global username
         global password
         global socks_proxy
-        show_topology = 'show isis instance CORE topology'
+        show_topology = 'show isis topology'
         main_logger.info(f"Gathering ISIS topology - if it's a full discovery could take some time")
+        start_isis_time = datetime.datetime.now()
+        main_logger.debug(f'Start time: {start_isis_time}')
         if not target_device:
             output_isis = MTCollector(self.pe_dict, show_topology, user=username, paswd=password,
                                       sock_proxy=socks_proxy, max_threads=3)
+            if 'not_connected' in output_isis:
+                main_logger.debug(f'\nDevices not connected\n{"-"*30}\n{output_isis["not_connected"]}')
             for device in output_isis:
                 if device != 'not_connected':
                     self._topology_population(self.topology_dict, output_isis[device][0][show_topology])
                 else:
-                    if device in self.pe_dict:
-                        mgmt_ip = self.pe_dict[device]
-                        single_ouptut = single_device_collection(mgmt_ip, show_topology)
-                        main_logger.debug(f'"NOT_CONNECTED" OUTPUT COLLECTION\n{"-" * 30}')
-                        main_logger.debug(f'output {show_topology} for {device}:\n{"-" * 30}\n{single_ouptut}\n\n')
-                        if device in single_ouptut:
-                            self._topology_population(self.topology_dict, single_ouptut)
-                            self._update_file(self.file)
+                    for not_connected in output_isis[device]:
+                        main_logger.debug(f'\n"NOT_CONNECTED" OUTPUT COLLECTION\n{"-" * 30}')
+                        if not_connected in self.pe_dict:
+                            mgmt_ip = self.pe_dict[not_connected]
+                            single_ouptut = single_device_collection(mgmt_ip, show_topology)
+                            if single_ouptut:
+                                self._topology_population(self.topology_dict, single_ouptut)
+                            else:
+                                main_logger.error(f'WARNING: Topology incomplete, unable to reach {not_connected}')
                         else:
-                            main_logger.error(f'WARNING: Topology incomplete, unable to reach {device}')
+                            main_logger.error(f'WARNING: Topology incomplete, {device} not found in IP DB')
         else:
             if target_device in self.pe_dict:
                 mgmt_ip = self.pe_dict[target_device]
                 single_ouptut = single_device_collection(mgmt_ip, show_topology)
-                main_logger.debug(f'TARGETED OUTPUT COLLECTION\n{"-" * 30}')
-                main_logger.debug(f'output {show_topology} for {target_device}:\n{"-" * 30}\n{single_ouptut}\n\n')
+                main_logger.debug(f'\nTARGETED OUTPUT COLLECTION\n{"-" * 30}')
+                main_logger.debug(f'\noutput {show_topology} for {target_device}:\n{"-" * 30}\n{single_ouptut}\n\n')
                 try:
                     self._topology_population(self.topology_dict, single_ouptut)
-                    self._update_file(self.file)
                 except TypeError:
                     main_logger.error(f'WARNING: Topology incomplete, unable to reach {target_device}')
+        end_isis_time = datetime.datetime.now()
+        main_logger.debug(f'Isis collection lasted: {(end_isis_time - start_isis_time).total_seconds()}')
 
     def _topology_population(self, topology_dict: dict, output: str) -> None:
-        main_logger.info('Starting Topology Population')
-        system = self.get_system(output)
+        system = self._get_system(output)
+        main_logger.debug(f'Starting Topology Population for system {system}')
         if system not in topology_dict:
             main_logger.debug(f'System not detected in current topology, creating base data structure')
             topology_dict[system] = {'edges': {}, 'nhsystems': {}}
-        for index, lines in enumerate(output.splitlines()):
-            no_newline_output = lines.split()
-            if len(no_newline_output) > 2 and index > 4:
-                if '--' not in no_newline_output:
-                    if no_newline_output[0] == no_newline_output[2]:
-                        main_logger.debug(f'\nEDGE DETECTED\n{"-"*30}\n\n Edge: {no_newline_output[0]}')
-                        self._new_edge(topology_dict[system]['edges'], no_newline_output)
+        output_lines = output.splitlines()
+        index = 2
+        while True:
+            if len(output_lines) <= index:
+                break
+            else:
+                line = output_lines[index]
+                if re.search(Regex.isis_instance, line, re.M):
+                    if 'ACCESS' in re.search(Regex.isis_instance, line, re.M).group(1):
+                        main_logger.debug(f'ISIS ACCESS instance detected, finishing the topology population')
+                        break
                     else:
-                        if index > 1:
-                            self._nhop_system(topology_dict[system]['nhsystems'], no_newline_output)
+                        index += 1
+                elif 'System Id' in line or line == '':
+                    index += 1
+                else:
+                    split_line = line.split()
+                    if len(split_line) > 2:
+                        if split_line[0] == split_line[2]:
+                            main_logger.debug(f'EDGE DETECTED - {split_line[0]}')
+                            self._new_edge(topology_dict[system]['edges'], split_line)
+                        else:
+                            self._nhop_system(topology_dict[system]['nhsystems'], split_line)
+                    index += 1
 
     def _load_from_file(self):
         topology_file_list = [os.path.join(self.db_wd, f) for f in os.listdir(self.db_wd) if 'topology' in f]
@@ -132,6 +157,7 @@ class IsisTopologyDB:
     def _first_time(self):
         main_logger.info(f'ISIS topology file not detected or force set to True! '
                          f'running a first time full topology query')
+        self.topology_dict = {}  # clear topology dict
         self._gather_topology()
         main_logger.info(f'ISIS Topology captured, saving to file...')
         if self.topology_dict:
@@ -535,8 +561,8 @@ if __name__ == '__main__':
         pe_file.close()
     topology = IsisTopologyDB()
     topology.set_pe_dict(pe_dict)
-    topology_dict = topology.get_topology(force=True)
-    source = 'che1r00001-ne-pe01'
+    topology.update_topology(force=True)
+    '''source = 'che1r00001-ne-pe01'
     vrf = '5GC-OAM'
     ip = '10.231.194.253'
     main_logger.info(f'Start Trace to ip {ip} at vrf {vrf}')
@@ -549,5 +575,5 @@ if __name__ == '__main__':
     rpf_path = printing_trace(rpf_list)
     main_logger.info(f'\nReversed Path\n{"-" * 30}\n{rpf_path}')
     end_time = datetime.datetime.now()
-    main_logger.info(f'Finished execution. Took {(end_time - start_time)}')
+    main_logger.info(f'Finished execution. Took {(end_time - start_time)}')'''
 
