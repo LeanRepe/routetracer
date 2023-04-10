@@ -776,9 +776,6 @@ def main(pe_dict: dict):
     if not set_arguments.username or not set_arguments.password:
         main_logger.error('Username (-u) and Password (-p) are mantadory! ')
         exit(1)
-    if not set_arguments.ipaddress:
-        main_logger.error('Missing IP Address (-i) to trace!')
-        exit(1)
     if not set_arguments.node:
         main_logger.error('Missing startig node (-n)')
         exit(1)
@@ -789,28 +786,32 @@ def main(pe_dict: dict):
     if set_arguments.generate_topology:
         topology.update_topology(force=True)
     elif set_arguments.update_node:
-        topology.update_site(set_arguments.n)
-    if set_arguments.socks:
-        ip = set_arguments.socks.split(':')[0]
-        port = int(set_arguments.socks.split(':')[1])
-        mtcollector_opts['socks_proxy'] = (ip, port)
-    isis_topology_dict = topology.get_topology()
-    ip_to_trace = set_arguments.ipaddress
-    node = set_arguments.node
-    if set_arguments.vrf:
-        trace, rpf_trace = run(node, ip_to_trace, isis_topology_dict, vrf=set_arguments.vrf)
+        topology.update_site(set_arguments.node)
     else:
-        trace, rpf_trace = run(node, ip_to_trace, isis_topology_dict)
-    end_host, end_ip, hop_list = trace
-    rpf_host, rpf_ip, rpf_hop_list = rpf_trace
-    os.system('clear')
-    final_report = printing_trace(hop_list)
-    rpf_final_report = printing_trace(rpf_hop_list)
-    print(f'{final_report}\nReversed Path\n{rpf_final_report}')
-    filename = node + '-' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    with open(f'{cwd}/tracelogs/{filename}.log', 'w') as file:
-        print(f'\n\nSaving results to {filename}')
-        file.write(f'{final_report}\nReversed Path\n{rpf_final_report}')
+        if not set_arguments.ipaddress:
+            main_logger.error('Missing IP Address (-i) to trace!')
+            exit(1)
+        if set_arguments.socks:
+            ip = set_arguments.socks.split(':')[0]
+            port = int(set_arguments.socks.split(':')[1])
+            mtcollector_opts['socks_proxy'] = (ip, port)
+        isis_topology_dict = topology.get_topology()
+        ip_to_trace = set_arguments.ipaddress
+        node = set_arguments.node
+        if set_arguments.vrf:
+            trace, rpf_trace = run(node, ip_to_trace, isis_topology_dict, vrf=set_arguments.vrf)
+        else:
+            trace, rpf_trace = run(node, ip_to_trace, isis_topology_dict)
+        end_host, end_ip, hop_list = trace
+        rpf_host, rpf_ip, rpf_hop_list = rpf_trace
+        os.system('clear')
+        final_report = printing_trace(hop_list)
+        rpf_final_report = printing_trace(rpf_hop_list)
+        print(f'{final_report}\nReversed Path\n{rpf_final_report}')
+        filename = node + '-' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        with open(f'{cwd}/tracelogs/{filename}.log', 'w') as file:
+            print(f'\n\nSaving results to {filename}')
+            file.write(f'{final_report}\nReversed Path\n{rpf_final_report}')
 
 
 mtcollector_opts = {
