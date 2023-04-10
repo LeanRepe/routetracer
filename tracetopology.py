@@ -5,6 +5,7 @@ import json
 import ipaddress
 import datetime
 import logging
+import logging.handlers
 import time
 import os
 import argparse
@@ -13,11 +14,11 @@ from mtcollector import MTCollector
 from ipaddress import AddressValueError
 
 main_logger = logging.getLogger(__name__)
-main_logger.setLevel(logging.DEBUG)
-logger_handler = logging.FileHandler(f'{__name__}.log', mode='w')
-logger_formatter = logging.Formatter('%(asctime)s,%(msecs)03d %(levelname)-3s [%(filename)s:%(lineno)d]8s %(message)s')
-logger_handler.setFormatter(logger_formatter)
-main_logger.addHandler(logger_handler)
+main_logger.setLevel(logging.INFO)
+logger_handlers = logging.handlers.RotatingFileHandler(f'tracetopology.log', maxBytes=(1048576*5), backupCount=7)
+logger_formatter = logging.Formatter('%(asctime)s,%(msecs)03d %(levelname)-3s [%(filename)s:%(lineno)d]-8s %(message)s')
+logger_handlers.setFormatter(logger_formatter)
+main_logger.addHandler(logger_handlers)
 
 
 class Regex:
@@ -26,7 +27,7 @@ class Regex:
     nhop_interface = r'^\s+\S+\s+connected,\s+via\s+(\S+)$'
     tip_desc = r''
     cef_vrf_subnet = r'^(\d+.\d+.\d+.\d+/\d+),\sversion.*$'
-    cef_nhop = r'^\s+via\s(BVI\d+|\d+.\d+.\d+.\d+/\d+|TenGigE\S+|Giga\S+),.*$'
+    cef_nhop = r'^\s+via\s(BVI\d+|\d+.\d+.\d+.\d+/\d+|TenGigE\S+|Giga\S+|Loopback\d+),.*$'
     cef_int_nhop = r'^\s+\d+\s+\S+\s+(\S+)\s+(\S+)\s+$'
     tunnel_desc = r'^.*To\s+(\S+):Tunnel-ip\d+$'
     connected_route = r'^^L\s+(\S+)\sis directly connected, \S+\s+(\S+)$'
@@ -226,7 +227,12 @@ def isis_topology_trace(topo_dict: dict, source: str, dest: str, hop: int = 0) -
             if start_node == '':
                 main_logger.error(f'Unable to find {current_node} connected to any edges')
             else:
+                if current_node in topo_dict[start_node]['edges']:
+                    nhi = topo_dict[start_node]['edges'][current_node]['nhi']
+                    hop_dict = {hop: {'node': current_node, 'egress_if': nhi, 'ingress_if': '---'}}
+                    hop_list.append(hop_dict)
                 current_node = start_node
+                hop += 1
                 continue
         else:
             if current_node in topo_dict:
@@ -258,7 +264,10 @@ def isis_topology_trace(topo_dict: dict, source: str, dest: str, hop: int = 0) -
                                           f'setting Ingress interface to blank')
                         ing_if = ''
                     hop_dict = {hop: {'node': current_node, 'egress_if': nhi, 'ingress_if': ing_if}}
-                    ing_ifz = topo_dict[dest]['edges'][current_node]['nhi']
+                    if 'AR' not in dest.split('-')[2]:
+                        ing_ifz = topo_dict[dest]['edges'][current_node]['nhi']
+                    else:
+                        ing_ifz = nhi
                     end_dict = {hop+1: {'node': dest, 'egress_if': '-----', 'ingress_if': ing_ifz}}
                     main_logger.debug(f'Current node: {current_node}, End: {dest}')
                     main_logger.debug(f'{hop_dict}\n{end_dict}')
@@ -302,7 +311,6 @@ def first_hop(output: str) -> str:
     hop = ''
     for lines in output.splitlines():
         no_newline_output = lines.split()
-        main_logger.debug(f'FISRT HOP Parsed output: {no_newline_output}\n')
         if len(no_newline_output) > 2:
             if no_newline_output[0] == no_newline_output[2]:
                 hop = no_newline_output[0]
@@ -353,6 +361,7 @@ def single_device_collection(node_ip: str, show: str) -> str:
 
 
 def run(start_node: str, ip: str, topo_dict: dict, source_ip: str = None, vrf: str = None) -> tuple:
+
     if source_ip is None:
         source_ip = get_conn_int(start_node, vrf, full_db)
     if check_ip(start_node):
@@ -388,6 +397,7 @@ def run(start_node: str, ip: str, topo_dict: dict, source_ip: str = None, vrf: s
 
 def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = None) -> tuple:
     global full_db
+    chy_routers = ['che1r00001-ne-pe01', 'CYSWY0001N-CS247-AGG003', 'CYSWY0001N-CS248-AGG004', 'che1r00001-ne-pe02']
     hop_list = []
     current_node = start_node
     current_ip = [ip for sys, ip in full_db.items() if start_node == sys][0]
@@ -396,7 +406,11 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
     main_logger.info(f'Starting Full Trace - start node: {start_node}')
     tunn_num = ''
     while True:
-        cef_output = single_device_collection(current_ip, show_cef)
+        if 'SERVICE-MGMT' in show_cef and current_node in chy_routers:
+            show_cef_mod = show_cef.replace('SERVICE-MGMT', 'MGMT')
+            cef_output = single_device_collection(current_ip, show_cef_mod)
+        else:
+            cef_output = single_device_collection(current_ip, show_cef)
         main_logger.debug(f'CEF OUTPUT - {current_node}\n{"-" * 30}\n{cef_output}\n\n')
         cef_hop_net, cef_int, cef_addr = cef_nhop(cef_output)
         if end_node != '':
@@ -464,9 +478,18 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                             next_node = isis_src(isis_hop_ip, cef_hop_net)
                             next_ip = full_db[next_node]
                             if len(hop_list) > 0:
-                                current_hop = [x for x, y in hop_list[-1].items()][0] + 1
-                                temp_list = isis_topology_trace(topo_dict, isis_hop, next_node, hop=current_hop)
-                                hop_list = hop_list + temp_list
+                                current_hop = [x for x, y in hop_list[-1].items()][0]
+                                next_hop = current_hop + 1
+                                temp_list = isis_topology_trace(topo_dict, isis_hop, next_node, hop=next_hop)
+                                if temp_list[0][next_hop]['node'] == hop_list[-1][current_hop]['node']:
+                                    hop_list[-1][current_hop]['egress_if'] = temp_list[0][next_hop]['egress_if']
+                                    temp_list.pop(0)
+                                    shifted_temp = []
+                                    for values in temp_list:
+                                        for hops in values:
+                                            new_hop = {hops - 1: values[hops]}
+                                            shifted_temp.append(new_hop)
+                                hop_list = hop_list + shifted_temp
                             else:
                                 hop_list = isis_topology_trace(topo_dict, isis_hop, next_node)
                         elif 'CS-PE' in current_node:
@@ -493,25 +516,37 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                             next_ip = full_db[next_node]
                             main_logger.debug(f'ISIS Topology trace from {current_node} to {next_node}\n')
                             if len(hop_list) > 0:
-                                current_hop = [x for x, y in hop_list[-1].items()][0] + 1
-                                temp_list = isis_topology_trace(topo_dict, current_node, next_node, hop=current_hop)
-                                hop_list = hop_list + temp_list
+                                current_hop = [x for x, y in hop_list[-1].items()][0]
+                                next_hop = current_hop + 1
+                                temp_list = isis_topology_trace(topo_dict, current_node, next_node, hop=next_hop)
+                                if temp_list[0][next_hop]['node'] == hop_list[-1][current_hop]['node']:
+                                    hop_list[-1][current_hop]['egress_if'] = temp_list[0][next_hop]['egress_if']
+                                    temp_list.pop(0)
+                                    shifted_temp = []
+                                    for values in temp_list:
+                                        for hops in values:
+                                            new_hop = {hops - 1: values[hops]}
+                                            shifted_temp.append(new_hop)
+                                hop_list = hop_list + shifted_temp
                             else:
                                 hop_list = isis_topology_trace(topo_dict, current_node, next_node)
                             if next_node == isis_hop:
                                 end_node = next_node
                                 end_ip = next_ip
-                    elif re.search(r'TenGi|Giga|BV', cef_hop_net):
+                    elif re.search(r'TenGi|Giga|BV|Loopback', cef_hop_net):
                         end_ip = current_ip
                         end_node = current_node
                         if len(hop_list) > 0:
-                            current_hop = [x for x, y in hop_list[-1].items()][0] + 1
-                            new_vrouter = {current_hop: {'node': current_node,
-                                                         'ingress_if': 'TU-IP',
-                                                         'egress_if': f'{cef_int}'
-                                                         }
-                                           }
-                            hop_list.append(new_vrouter)
+                            current_hop = [x for x, y in hop_list[-1].items()][0]
+                            if hop_list[-1][current_hop]['node'] == current_node:
+                                hop_list[-1][current_hop]['egress_if'] = f'{cef_hop_net}'
+                            else:
+                                new_vrouter = {current_hop: {'node': current_node,
+                                                             'ingress_if': 'TU-IP',
+                                                             'egress_if': f'{cef_int}'
+                                                             }
+                                               }
+                                hop_list.append(new_vrouter)
                         else:
                             current_hop = 0
                             new_vrouter = {current_hop: {'node': current_node,
@@ -559,7 +594,7 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                     except IndexError:
                         main_logger.error(f'Device {next_node} not found in JSON database')
                         exit(1)
-                elif re.search(r'TenGi|Giga|BV', cef_int):
+                elif re.search(r'TenGi|Giga|BV|Loopback', cef_int):
                     end_ip = current_ip
                     end_node = current_node
                     if 'CS-PE' in current_node:
@@ -586,12 +621,15 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                     else:
                         if len(hop_list) > 0:
                             current_hop = [x for x, y in hop_list[-1].items()][0] + 1
-                            new_vrouter = {current_hop: {'node': current_node,
-                                                         'ingress_if': '---',
-                                                         'egress_if': f'{"TU-" + tunn_num}'
-                                                         }
-                                           }
-                            hop_list.append(new_vrouter)
+                            if hop_list[-1][current_hop]['node'] == current_node:
+                                hop_list[-1][current_hop]['egress_if'] = f'{cef_int}'
+                            else:
+                                new_vrouter = {current_hop: {'node': current_node,
+                                                             'ingress_if': '---',
+                                                             'egress_if': f'{"TU-" + tunn_num}'
+                                                             }
+                                               }
+                                hop_list.append(new_vrouter)
                         else:
                             current_hop = 0
                             new_vrouter = {current_hop: {'node': current_node,
@@ -732,6 +770,9 @@ def arguments():
 def main(pe_dict: dict):
     global mtcollector_opts
     set_arguments = arguments()
+    if set_arguments.loglevel:
+        log_level = logging.getLevelName(set_arguments.loglevel.upper())
+        main_logger.setLevel(log_level)
     if not set_arguments.username or not set_arguments.password:
         main_logger.error('Username (-u) and Password (-p) are mantadory! ')
         exit(1)
@@ -781,12 +822,15 @@ if __name__ == '__main__':
     start_time = datetime.datetime.now()
     main_logger.info(f'Starting at {start_time}')
     print_banner()
-    with open('/Users/lrepetto/Documents/full_db.json', 'r') as file:
+    with open(f'{cwd}/database/full_db.json', 'r') as file:
         full_db = json.load(file)
         file.close()
     with open(f'{cwd}/database/dish_pes.json') as pe_file:
         pe_dict = json.load(pe_file)
         pe_file.close()
     main(pe_dict)
+    end_time = datetime.datetime.now()
+    main_logger.info(f'Ending at {start_time}')
+    main_logger.info(f'job lasted for: {(end_time - start_time).total_seconds()}')
     print('Thank you for using TraceTopology! any feedback is more than wellcome!')
 
