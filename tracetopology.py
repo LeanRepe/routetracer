@@ -776,9 +776,6 @@ def main(pe_dict: dict):
     if not set_arguments.username or not set_arguments.password:
         main_logger.error('Username (-u) and Password (-p) are mantadory! ')
         exit(1)
-    if not set_arguments.node:
-        main_logger.error('Missing startig node (-n)')
-        exit(1)
     mtcollector_opts['user'] = set_arguments.username
     mtcollector_opts['paswd'] = set_arguments.password
     topology = IsisTopologyDB()
@@ -786,8 +783,14 @@ def main(pe_dict: dict):
     if set_arguments.generate_topology:
         topology.update_topology(force=True)
     elif set_arguments.update_node:
+        if not set_arguments.node:
+            main_logger.error('Missing startig node (-n)')
+            exit(1)
         topology.update_site(set_arguments.node)
     else:
+        if not set_arguments.node:
+            main_logger.error('Missing startig node (-n)')
+            exit(1)
         if not set_arguments.ipaddress:
             main_logger.error('Missing IP Address (-i) to trace!')
             exit(1)
