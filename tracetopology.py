@@ -489,7 +489,9 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                                         for hops in values:
                                             new_hop = {hops - 1: values[hops]}
                                             shifted_temp.append(new_hop)
-                                hop_list = hop_list + shifted_temp
+                                    hop_list = hop_list + shifted_temp
+                                else:
+                                    hop_list = hop_list + temp_list
                             else:
                                 hop_list = isis_topology_trace(topo_dict, isis_hop, next_node)
                         elif 'CS-PE' in current_node:
@@ -527,7 +529,9 @@ def full_trace(topo_dict: dict, show_cef: str, start_node: str, isis_hop: str = 
                                         for hops in values:
                                             new_hop = {hops - 1: values[hops]}
                                             shifted_temp.append(new_hop)
-                                hop_list = hop_list + shifted_temp
+                                    hop_list = hop_list + shifted_temp
+                                else:
+                                    hop_list = hop_list + temp_list
                             else:
                                 hop_list = isis_topology_trace(topo_dict, current_node, next_node)
                             if next_node == isis_hop:
